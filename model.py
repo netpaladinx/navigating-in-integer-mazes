@@ -9,11 +9,11 @@ import task
 
 default_hparams = tf.contrib.training.HParams(
     n_nodes=10000,  # 0 ~ 9999
-    n_dims=100,
+    n_dims=50,
     n_type_rels=10,
     learning_rate=0.0001,
     max_itrs=2000,
-    batch_size=50
+    batch_size=20
 )
 
 EPSILON = 1e-8
@@ -69,15 +69,15 @@ class Model(object):
         self.focus_2, self.state_2 = self._jump(self.focus_1, self.state_1)
         self.focus_3, self.state_3 = self._jump(self.focus_2, self.state_2)
         self.focus_4, self.state_4 = self._jump(self.focus_3, self.state_3)  # bs x n_nodes, bs x n_nodes x n_dims
-
+        
         dst_idx_flattened = tf.range(0, self.batch_size) * hp.n_nodes + self.dst
         self.prediction_prob = tf.gather(tf.reshape(self.focus_4, [-1]), dst_idx_flattened)  # bs
 
-        self.loss = tf.reduce_mean(-tf.log(self.prediction_prob))
-        self.error_top1 = tf.reduce_mean(tf.cast(tf.not_equal(tf.argmax(self.focus_4, axis=1, output_type=tf.int32), self.dst), tf.float32))
-        self.error_top5 = tf.reduce_mean(tf.cast(tf.nn.in_top_k(self.focus_4, self.dst, 5), tf.float32))
-        self.error_top10 = tf.reduce_mean(tf.cast(tf.nn.in_top_k(self.focus_4, self.dst, 10), tf.float32))
-        self.error_top20 = tf.reduce_mean(tf.cast(tf.nn.in_top_k(self.focus_4, self.dst, 20), tf.float32))
+        self.loss = tf.reduce_mean(-tf.log(self.prediction_prob + 1./hp.n_nodes*EPSILON))
+        self.hit_top1 = tf.reduce_mean(tf.cast(tf.equal(tf.argmax(self.focus_4, axis=1, output_type=tf.int32), self.dst), tf.float32))
+        self.hit_top5 = tf.reduce_mean(tf.cast(tf.nn.in_top_k(self.focus_4, self.dst, 5), tf.float32))
+        self.hit_top10 = tf.reduce_mean(tf.cast(tf.nn.in_top_k(self.focus_4, self.dst, 10), tf.float32))
+        self.hit_top20 = tf.reduce_mean(tf.cast(tf.nn.in_top_k(self.focus_4, self.dst, 20), tf.float32))
 
         self.global_step = tf.train.create_global_step()
         self.train_op = tf.train.AdamOptimizer(learning_rate=hp.learning_rate).minimize(loss=self.loss, global_step=self.global_step)
@@ -100,8 +100,8 @@ class Model(object):
 
         hidden = tf.tanh(tf.tensordot(state, self.weight_sta, [[2], [0]]) + tf.tensordot(self.node_emb, self.weight_emb, [[1], [0]]) + self.bias_hid) # bs x n_nodes x n_dims
         hidden_emb = tf.reshape(tf.transpose(hidden, perm=[1, 0, 2]), [hp.n_nodes, -1])  # n_nodes x (bs*n_dims)
-        hidden_from = tf.nn.embedding_lookup(hidden_emb, self.maze.edges_from()) # n_edges x (bs*n_dims)
-        hidden_to = tf.nn.embedding_lookup(hidden_emb, self.maze.edges_to())  # n_edges x (bs*n_dims)
+        hidden_from = tf.gather(hidden_emb, self.maze.edges_from()) # n_edges x (bs*n_dims)
+        hidden_to = tf.gather(hidden_emb, self.maze.edges_to())  # n_edges x (bs*n_dims)
         
         n2n_dims = tf.reshape(hidden_from * hidden_to, [self.maze.num_edges(), -1, hp.n_dims])  # n_edges x bs x n_dims
         n2n_rels = tf.nn.softplus(tf.tensordot(n2n_dims, self.weight_rel, [[2], [1]]) + self.bias_rel) * tf.expand_dims(tf.cast(self.maze.edges_rels(), tf.float32), axis=1)  # n_edges x bs x n_type_rels
@@ -109,17 +109,17 @@ class Model(object):
 
         bs = tf.shape(trans)[1]
         trans_rd_sum = tf.segment_sum(trans, self.maze.edges_from()) # n_nodes (from) x bs
-        trans_rd_sum = tf.nn.embedding_lookup(trans_rd_sum, self.maze.edges_from())  # n_edges x bs
+        trans_rd_sum = tf.gather(trans_rd_sum, self.maze.edges_from())  # n_edges x bs
         trans_nor = trans / trans_rd_sum  # n_edges x bs
         
         msg_sent = hidden * tf.expand_dims(focus, axis=2)  # bs x n_nodes (from) x n_dims
         msg_emb = tf.reshape(tf.transpose(msg_sent, perm=[1, 0, 2]), [hp.n_nodes, -1])  # n_nodes (from) x (bs*n_dims)
-        msg_from = tf.reshape(tf.nn.embedding_lookup(msg_emb, self.maze.edges_from()), [self.maze.num_edges(), -1, hp.n_dims])  # n_edges x bs x n_dims
+        msg_from = tf.reshape(tf.gather(msg_emb, self.maze.edges_from()), [self.maze.num_edges(), -1, hp.n_dims])  # n_edges x bs x n_dims
         
         msg_to = msg_from * tf.expand_dims(trans_nor, axis=2)  # n_edges x bs x n_dims
         msg_recv = tf.transpose(tf.unsorted_segment_sum(msg_to, self.maze.edges_to(), hp.n_nodes), perm=[1, 0, 2])  # bs x n_nodes (to) x n_dims
 
-        focus_from = tf.nn.embedding_lookup(tf.transpose(focus), self.maze.edges_from())  # n_edges x bs
+        focus_from = tf.gather(tf.transpose(focus), self.maze.edges_from())  # n_edges x bs
         focus_to = focus_from * trans_nor  # n_edges x bs
         focus = tf.transpose(tf.unsorted_segment_sum(focus_to, self.maze.edges_to(), hp.n_nodes))  # bs x n_nodes (to)
         state = state + msg_recv  # bs x n_nodes (to) x n_dims
@@ -132,21 +132,22 @@ class Model(object):
         with tf.Session(graph=self.tf_graph, config=self.tf_config) as sess:
             sess.run(self.init_op)
 
-            n_itr = 0
+            n_itrs = 0
             n_examples = 0
-            while n_itr < hp.max_itrs:
+            while n_itrs < hp.max_itrs:
                 samples = self.maze.sampler(hp.batch_size)
-                _, loss, err_top1, err_top5, err_top10, err_top20 = \
-                    sess.run([self.train_op, self.loss, self.error_top1, self.error_top5, self.error_top10, self.error_top20], 
+                _, loss, hit_top1, hit_top5, hit_top10, hit_top20 = \
+                    sess.run([self.train_op, self.loss, self.hit_top1, self.hit_top5, self.hit_top10, self.hit_top20], 
                              feed_dict={self.input_pl: samples})
                 
-                n_itr += 1
+                n_itrs += 1
                 n_examples += hp.batch_size
-                if (n_itr + 1) % FLAGS.print_freq == 0:
-                    print('n_itr: %d | loss: %.8f | err_top1: %.8f | err_top5: %.8f | err_top10: %.8f | err_top20: %.8f' % loss, err_top1, err_top5, err_top10, err_top20)     
+                if (n_itrs + 1) % FLAGS.print_freq == 0:
+                    print('n_itrs: %d | n_examples: %d | loss: %.8f | hit_top1: %.8f | hit_top5: %.8f | hit_top10: %.8f | hit_top20: %.8f' % 
+                          (n_itrs, n_examples, loss, hit_top1, hit_top5, hit_top10, hit_top20))
 
 if __name__ == '__main__':
-    tf.flags.DEFINE_integer("print_freq", 100, "Frequency of printing")
+    tf.flags.DEFINE_integer("print_freq", 1, "Frequency of printing")
     FLAGS = tf.flags.FLAGS
 
     maze = task.IntegerMaze()
