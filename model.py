@@ -49,17 +49,18 @@ class Model(object):
 
         self.node_emb = None
         self.rw_graph = None
-        self.weight_inp = tf.get_variable('weigth_inp', shape=[2*hp.n_dims, hp.n_dims], initializer=tf.variance_scaling_initializer())  # (2*n_dims) x n_dims
+        self.weight_inp_src = tf.get_variable('weight_inp_src', shape=[hp.n_dims, hp.n_dims], initializer=tf.initializers.identity())  # n_dims x n_dims
+        self.weight_inp_dst = tf.get_variable('weight_inp_dst', shape=[hp.n_dims, hp.n_dims], initializer=tf.initializers.identity())  # n_dims x n_dims
         self.bias_inp = tf.get_variable('bias_inp', shape=[hp.n_dims], initializer=tf.zeros_initializer())  # n_dims
-        self.weight_sta = tf.get_variable('weight_sta', shape=[hp.n_dims, hp.n_dims], initializer=tf.variance_scaling_initializer())  # n_dims x n_dims
-        self.weight_emb = tf.get_variable('weight_emb', shape=[hp.n_dims, hp.n_dims], initializer=tf.variance_scaling_initializer())  # n_dims x n_dims
+        self.weight_sta = tf.get_variable('weight_sta', shape=[hp.n_dims, hp.n_dims], initializer=tf.initializers.identity())  # n_dims x n_dims
+        self.weight_emb = tf.get_variable('weight_emb', shape=[hp.n_dims, hp.n_dims], initializer=tf.initializers.identity())  # n_dims x n_dims
         self.bias_hid = tf.get_variable('bias_hid', shape=[hp.n_dims], initializer=tf.zeros_initializer())  # n_dims
         self.weight_rel = tf.get_variable('weight_rel', shape=[hp.n_type_rels, hp.n_dims], initializer=tf.variance_scaling_initializer())  # n_type_rels x n_dims
         self.bias_rel = tf.get_variable('bias_rel', shape=[hp.n_type_rels], initializer=tf.zeros_initializer())  # n_type_rels
 
         self.src_emb = self._get_embs(self.src)  # bs x n_dims
         self.dst_emb = self._get_embs(self.dst)  # bs x n_dims
-        self.context = tf.tanh(tf.matmul(tf.concat([self.src_emb, self.dst_emb], axis=1), self.weight_inp) + self.bias_inp)  # bs x n_dims
+        self.context = tf.tanh(tf.matmul(self.src_emb, self.weight_inp_src) + tf.matmul(self.dst_emb, self.weight_inp_dst) + self.bias_inp)  # bs x n_dims
 
         self.focus_init = tf.one_hot(self.src, hp.n_nodes)  # bs x n_nodes
         self.state_init = tf.expand_dims(self.focus_init, axis=-1) * tf.expand_dims(self.context, axis=1)  # bs x n_nodes x n_dims
@@ -83,7 +84,7 @@ class Model(object):
         hp = self.hparams
         with tf.device('/cpu:0'):
             if self.node_emb is None:
-                self.node_emb = tf.get_variable('node_embs', shape=[hp.n_nodes, hp.n_dims], initializer=tf.truncated_normal_initializer(stddev=0.01))  # n_nodes x n_dims
+                self.node_emb = tf.get_variable('node_emb', shape=[hp.n_nodes, hp.n_dims], initializer=tf.truncated_normal_initializer(stddev=0.01))  # n_nodes x n_dims
             return tf.nn.embedding_lookup(self.node_emb, inp)
 
     def _masked_by_rw_graph(self, inp):
@@ -95,34 +96,37 @@ class Model(object):
             return self.rw_graph * inp
 
     def _jump(self, focus, state):
+        '''
+        focus: bs x n_nodes (from)
+        state: bs x n_nodes (from) x n_dims
+        '''
         hp = self.hparams
 
         hidden = tf.tanh(tf.tensordot(state, self.weight_sta, [[2], [0]]) + tf.tensordot(self.node_emb, self.weight_emb, [[1], [0]]) + self.bias_hid) # bs x n_nodes x n_dims
-        hidden_embs = tf.reshape(tf.transpose(hidden, perm=[1, 0, 2]), [hp.n_nodes, -1])  # n_nodes x (bs*n_dims)
-        hidden_from = tf.nn.embedding_lookup(hidden_embs, self.maze.edges_from()) # n_edges x (bs*n_dims)
-        hidden_to = tf.nn.embedding_lookup(hidden_embs, self.maze.edges_to())  # n_edges x (bs*n_dims)
+        hidden_emb = tf.reshape(tf.transpose(hidden, perm=[1, 0, 2]), [hp.n_nodes, -1])  # n_nodes x (bs*n_dims)
+        hidden_from = tf.nn.embedding_lookup(hidden_emb, self.maze.edges_from()) # n_edges x (bs*n_dims)
+        hidden_to = tf.nn.embedding_lookup(hidden_emb, self.maze.edges_to())  # n_edges x (bs*n_dims)
 
         n2n_dims = tf.reshape(hidden_from * hidden_to, [self.maze.num_edges(), -1, hp.n_dims])  # n_edges x bs x n_dims
         n2n_rels = tf.nn.softplus(tf.tensordot(n2n_dims, self.weight_rel, [[2], [1]]) + self.bias_rel) * tf.expand_dims(self.maze.edges_rels(), axis=1)  # n_edges x bs x n_type_rels
         trans = tf.reduce_sum(n2n_rels, axis=2)  # n_edges x bs
 
         bs = tf.shape(trans)[1]
-        ### ???
-        indices = tf.concat([self.maze.edges(), tf.expand_dims(tf.range(bs), axis=1)], axis=1)  # n_edges x 3
-        trans_sp = tf.SparseTensor(indices=indices, values=tf.reshape(trans, [-1]), dense_shape=[hp.n_nodes, hp.n_nodes, bs])  # n_nodes (from) x n_nodes (to) x bs [sparse]
-        trans_sp = trans_sp / tf.sparse_reduce_sum(trans_sp, axis=1, keep_dims=True)  # n_nodes (from) x n_nodes (to) x bs [sparse]
-
+        trans_rd_sum = tf.segment_sum(trans, self.maze.edges_from()) # n_nodes (from) x bs
+        trans_rd_sum = tf.nn.embedding_lookup(trans_rd_sum, self.maze.edges_from())  # n_edges x bs
+        trans_nor = trans / trans_rd_sum  # n_edges x bs
+        
         msg_sent = hidden * tf.expand_dims(focus, axis=2)  # bs x n_nodes (from) x n_dims
         msg_embs = tf.reshape(tf.transpose(msg_sent, perm=[1, 0, 2]), [hp.n_nodes, -1])  # n_nodes (from) x (bs*n_dims)
         msg_from = tf.reshape(tf.nn.embedding_lookup(msg_embs, self.maze.edges_from()), [self.maze.num_edges(), -1, hp.n_dims])  # n_edges x bs x n_dims
-        msg_to = msg_from * tf.expand_dims(tf.reshape(trans_sp.values, [self.maze.num_edges(), -1]), axis=2)  # n_edges x bs x n_dims
-        indices = tf.concat([indices, ])
-        msg_to = tf.SparseTensor(indices=indices, values=tf.reshape(msg_to, [-1]), )
+        
+        msg_to = msg_from * tf.expand_dims(trans_nor, axis=2)  # n_edges x bs x n_dims
+        msg_recv = tf.transpose(tf.segment_sum(msg_to, self.maze.edges_to()), perm=[1, 0, 2])  # bs x n_nodes (to) x n_dims
 
-        msg_recv = tf.matmul(trans, msg_sent, transpose_a=True)  # bs x n_nodes (to) x n_dims
-
-        focus = tf.matmul(trans, tf.expand_dims(focus, axis=2), transpose_a=True)  # bs x n_nodes
-        state = state + msg_recv
+        focus_from = tf.nn.embedding_lookup(tf.transpose(focus), self.maze.edges_from())  # n_edges x bs
+        focus_to = focus_from * trans_nor  # n_edges x bs
+        focus = tf.transpose(tf.segment_sum(focus_to, self.maze.edges_to()))  # bs x n_nodes (to)
+        state = state + msg_recv  # bs x n_nodes (to) x n_dims
 
         return focus, state
 
