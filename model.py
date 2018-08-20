@@ -48,7 +48,6 @@ class Model(object):
         self.dst = tf.squeeze(self.dst, axis=1)  # bs
 
         self.node_emb = None
-        self.rw_graph = None
         self.weight_inp_src = tf.get_variable('weight_inp_src', shape=[hp.n_dims, hp.n_dims], initializer=tf.initializers.identity())  # n_dims x n_dims
         self.weight_inp_dst = tf.get_variable('weight_inp_dst', shape=[hp.n_dims, hp.n_dims], initializer=tf.initializers.identity())  # n_dims x n_dims
         self.bias_inp = tf.get_variable('bias_inp', shape=[hp.n_dims], initializer=tf.zeros_initializer())  # n_dims
@@ -79,21 +78,12 @@ class Model(object):
         self.global_step = tf.train.create_global_step()
         self.train_op = tf.train.AdamOptimizer(learning_rate=hp.learning_rate).minimize(loss=self.loss, global_step=self.global_step)
 
-
     def _get_embs(self, inp):
         hp = self.hparams
         with tf.device('/cpu:0'):
             if self.node_emb is None:
                 self.node_emb = tf.get_variable('node_emb', shape=[hp.n_nodes, hp.n_dims], initializer=tf.truncated_normal_initializer(stddev=0.01))  # n_nodes x n_dims
             return tf.nn.embedding_lookup(self.node_emb, inp)
-
-    def _masked_by_rw_graph(self, inp):
-        hp = self.hparams
-        with tf.device('/cpu:0'):
-            if self.rw_graph is None:
-                self.rw_graph_re = tf.get_variable('rw_graph', shape=[hp.n_nodes, hp.n_nodes, hp.n_type_rels], initializer=tf.constant_initializer(task.get_), dtype=tf.bool)  # n_nodes x n_nodes x n_type_rels
-
-            return self.rw_graph * inp
 
     def _jump(self, focus, state):
         '''
