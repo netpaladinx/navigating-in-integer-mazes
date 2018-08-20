@@ -9,10 +9,11 @@ import task
 
 default_hparams = tf.contrib.training.HParams(
     n_nodes=10000,  # 0 ~ 9999
-    n_dims=128,
-    batch_size=16,
-    n_type_rels=8,
-    learning_rate=0.0001
+    n_dims=100,
+    n_type_rels=10,
+    learning_rate=0.0001,
+    max_itrs=2000,
+    batch_size=50
 )
 
 EPSILON = 1e-8
@@ -73,10 +74,15 @@ class Model(object):
         self.prediction_prob = tf.gather(tf.reshape(self.focus_4, [-1]), dst_idx_flattened)  # bs
 
         self.loss = tf.reduce_mean(-tf.log(self.prediction_prob))
-        self.error = tf.reduce_mean(tf.cast(tf.not_equal(tf.argmax(self.focus_4, axis=1), self.dst), tf.float32))
+        self.error_top1 = tf.reduce_mean(tf.cast(tf.not_equal(tf.argmax(self.focus_4, axis=1, output_type=tf.int32), self.dst), tf.float32))
+        self.error_top5 = tf.reduce_mean(tf.cast(tf.nn.in_top_k(self.focus_4, self.dst, 5), tf.float32))
+        self.error_top10 = tf.reduce_mean(tf.cast(tf.nn.in_top_k(self.focus_4, self.dst, 10), tf.float32))
+        self.error_top20 = tf.reduce_mean(tf.cast(tf.nn.in_top_k(self.focus_4, self.dst, 20), tf.float32))
 
         self.global_step = tf.train.create_global_step()
         self.train_op = tf.train.AdamOptimizer(learning_rate=hp.learning_rate).minimize(loss=self.loss, global_step=self.global_step)
+        
+        self.init_op = tf.global_variables_initializer()
 
     def _get_embs(self, inp):
         hp = self.hparams
@@ -96,9 +102,9 @@ class Model(object):
         hidden_emb = tf.reshape(tf.transpose(hidden, perm=[1, 0, 2]), [hp.n_nodes, -1])  # n_nodes x (bs*n_dims)
         hidden_from = tf.nn.embedding_lookup(hidden_emb, self.maze.edges_from()) # n_edges x (bs*n_dims)
         hidden_to = tf.nn.embedding_lookup(hidden_emb, self.maze.edges_to())  # n_edges x (bs*n_dims)
-
+        
         n2n_dims = tf.reshape(hidden_from * hidden_to, [self.maze.num_edges(), -1, hp.n_dims])  # n_edges x bs x n_dims
-        n2n_rels = tf.nn.softplus(tf.tensordot(n2n_dims, self.weight_rel, [[2], [1]]) + self.bias_rel) * tf.expand_dims(self.maze.edges_rels(), axis=1)  # n_edges x bs x n_type_rels
+        n2n_rels = tf.nn.softplus(tf.tensordot(n2n_dims, self.weight_rel, [[2], [1]]) + self.bias_rel) * tf.expand_dims(tf.cast(self.maze.edges_rels(), tf.float32), axis=1)  # n_edges x bs x n_type_rels
         trans = tf.reduce_sum(n2n_rels, axis=2)  # n_edges x bs
 
         bs = tf.shape(trans)[1]
@@ -107,21 +113,37 @@ class Model(object):
         trans_nor = trans / trans_rd_sum  # n_edges x bs
         
         msg_sent = hidden * tf.expand_dims(focus, axis=2)  # bs x n_nodes (from) x n_dims
-        msg_embs = tf.reshape(tf.transpose(msg_sent, perm=[1, 0, 2]), [hp.n_nodes, -1])  # n_nodes (from) x (bs*n_dims)
-        msg_from = tf.reshape(tf.nn.embedding_lookup(msg_embs, self.maze.edges_from()), [self.maze.num_edges(), -1, hp.n_dims])  # n_edges x bs x n_dims
+        msg_emb = tf.reshape(tf.transpose(msg_sent, perm=[1, 0, 2]), [hp.n_nodes, -1])  # n_nodes (from) x (bs*n_dims)
+        msg_from = tf.reshape(tf.nn.embedding_lookup(msg_emb, self.maze.edges_from()), [self.maze.num_edges(), -1, hp.n_dims])  # n_edges x bs x n_dims
         
         msg_to = msg_from * tf.expand_dims(trans_nor, axis=2)  # n_edges x bs x n_dims
-        msg_recv = tf.transpose(tf.segment_sum(msg_to, self.maze.edges_to()), perm=[1, 0, 2])  # bs x n_nodes (to) x n_dims
+        msg_recv = tf.transpose(tf.unsorted_segment_sum(msg_to, self.maze.edges_to(), hp.n_nodes), perm=[1, 0, 2])  # bs x n_nodes (to) x n_dims
 
         focus_from = tf.nn.embedding_lookup(tf.transpose(focus), self.maze.edges_from())  # n_edges x bs
         focus_to = focus_from * trans_nor  # n_edges x bs
-        focus = tf.transpose(tf.segment_sum(focus_to, self.maze.edges_to()))  # bs x n_nodes (to)
+        focus = tf.transpose(tf.unsorted_segment_sum(focus_to, self.maze.edges_to(), hp.n_nodes))  # bs x n_nodes (to)
         state = state + msg_recv  # bs x n_nodes (to) x n_dims
 
         return focus, state
 
     def train(self, FLAGS):
-        pass
+        hp = self.hparams
+        
+        with tf.Session(graph=self.tf_graph, config=self.tf_config) as sess:
+            sess.run(self.init_op)
+
+            n_itr = 0
+            n_examples = 0
+            while n_itr < hp.max_itrs:
+                samples = self.maze.sampler(hp.batch_size)
+                _, loss, err_top1, err_top5, err_top10, err_top20 = \
+                    sess.run([self.train_op, self.loss, self.error_top1, self.error_top5, self.error_top10, self.error_top20], 
+                             feed_dict={self.input_pl: samples})
+                
+                n_itr += 1
+                n_examples += hp.batch_size
+                if (n_itr + 1) % FLAGS.print_freq == 0:
+                    print('n_itr: %d | loss: %.8f | err_top1: %.8f | err_top5: %.8f | err_top10: %.8f | err_top20: %.8f' % loss, err_top1, err_top5, err_top10, err_top20)     
 
 if __name__ == '__main__':
     tf.flags.DEFINE_integer("print_freq", 100, "Frequency of printing")
